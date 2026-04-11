@@ -1,62 +1,60 @@
-from pwdlib import PasswordHash
-from app.models import *
-from app.database import get_session
+from fastapi import APIRouter, HTTPException, Depends, status
 from sqlmodel import select
-from datetime import timedelta, datetime, timezone
 from app.database import SessionDep
-from fastapi.security import OAuth2PasswordBearer
+from app.models import *
+from app.auth import encrypt_password, verify_password, create_access_token, AuthDep
+from fastapi.security import OAuth2PasswordRequestForm
 from typing import Annotated
-from fastapi import Depends, HTTPException, status
-import jwt
-from jwt.exceptions import InvalidTokenError
+
+auth_router = APIRouter(tags=["Authentication"])
 
 
-SECRET_KEY = "ThisIsAnExampleOfWhatNotToUseAsTheSecretKeyIRL"
-ALGORITHM = "HS256"
+@auth_router.post("/token")
+async def login_for_access_token(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: SessionDep
+) -> Token:
 
-password_hash = PasswordHash.recommended()
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+    user = db.exec(select(RegularUser).where(RegularUser.username == form_data.username)).one_or_none()
 
-# Converts plaintext password to encrypted password
-def encrypt_password(password:str):
-    return password_hash.hash(password)
+    if not user or not verify_password(form_data.password, user.password):
+        user = db.exec(select(Admin).where(Admin.username == form_data.username)).one_or_none()
 
-# Verifies if a plaintext password, when encrypted, gives the same output as the expected encrypted password
-def verify_password(plaintext_password:str, encrypted_password):
-    return password_hash.verify(password=plaintext_password, hash=encrypted_password)
+        if not user or not verify_password(form_data.password, user.password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
-# This takes some information and converts it into a JWT
-def create_access_token(data: dict, expires_delta: timedelta = timedelta(minutes=15)):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-# Gets the current user who is making the request
-async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)], db:SessionDep)->User:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
+    access_token = create_access_token(
+        data={"sub": user.id, "role": user.role},
     )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub",None)
-        user_role = payload.get("role", None)
-        if user_id is None or user_role is None:
-            raise credentials_exception
-    except InvalidTokenError:
-        raise credentials_exception
-    user = None
 
-    if user_role == "admin":
-        user = db.get(Admin,user_id)
-    else:
-        user = db.get(RegularUser,user_id)
-    if user is None:
-        raise credentials_exception
+    return Token(access_token=access_token, token_type="bearer")
+
+
+@auth_router.get("/identify", response_model=UserResponse)
+def get_user_by_id(db: SessionDep, user: AuthDep):
     return user
 
-AuthDep = Annotated[User, Depends(get_current_user)]
+
+@auth_router.post('/signup', response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def signup_user(user_data: UserCreate, db: SessionDep):
+    try:
+        new_user = RegularUser(
+            username=user_data.username,
+            email=user_data.email,
+            password=encrypt_password(user_data.password)
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+        return new_user
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Username or email already exists",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
